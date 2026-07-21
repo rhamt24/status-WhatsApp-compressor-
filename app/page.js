@@ -180,11 +180,16 @@ export default function Page() {
       for (const entry of trak.mdia.minf.stbl.stsd.entries) {
         const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
         if (box) {
-          const stream = new window.MP4Box.DataStream(
-            undefined,
-            0,
-            window.MP4Box.DataStream.BIG_ENDIAN
-          );
+          // DataStream adalah global tersendiri yang dibawa mp4box.all.min.js
+          // (bukan properti window.MP4Box), tapi jaga-jaga untuk versi lain
+          // yang menaruhnya di window.MP4Box.DataStream.
+          const DS = window.DataStream || window.MP4Box?.DataStream;
+          if (!DS) {
+            throw new Error(
+              "DataStream tidak ditemukan di window — versi mp4box.js yang dimuat mungkin tidak kompatibel."
+            );
+          }
+          const stream = new DS(undefined, 0, DS.BIG_ENDIAN);
           box.write(stream);
           return new Uint8Array(stream.buffer, 8); // buang header box (size+fourcc)
         }
