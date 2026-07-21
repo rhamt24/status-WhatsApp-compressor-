@@ -3,14 +3,13 @@
 import { useEffect } from "react";
 
 const SPLIT_SECONDS = 90;
+const MP4BOX_URL = "https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js";
+const MP4_MUXER_URL = "https://esm.run/mp4-muxer@5.2.2";
 
 export default function Page() {
   useEffect(() => {
-    let ffmpeg = null;
-    let ffmpegReady = false;
     let currentFile = null;
     let currentMeta = { duration: 0, width: 0, height: 0 };
-    let partIndex = 0;
 
     const dropzone = document.getElementById("dropzone");
     const fileInput = document.getElementById("fileInput");
@@ -44,6 +43,14 @@ export default function Page() {
         alert("Pilih file video ya.");
         return;
       }
+      const ext = (file.name.split(".").pop() || "").toLowerCase();
+      if (ext !== "mp4" && ext !== "m4v" && file.type !== "video/mp4") {
+        alert(
+          "Versi GPU cuma dukung file MP4 (hasil rekam HP kebanyakan sudah MP4). File MOV/MKV/WebM belum didukung."
+        );
+        return;
+      }
+
       currentFile = file;
       errorBox.classList.add("hidden");
       resultPanel.classList.add("hidden");
@@ -125,126 +132,454 @@ export default function Page() {
       progressLabel.textContent = text;
     }
 
-    async function ensureFfmpegLoaded() {
-      if (window.FFmpeg) return;
-      await new Promise((resolve, reject) => {
-        const existing = document.getElementById("ffmpeg-script");
+    // ---------- loader helpers ----------
+
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const existing = document.querySelector(`script[data-src="${src}"]`);
         if (existing) {
-          existing.addEventListener("load", resolve);
+          if (existing.dataset.loaded === "1") return resolve();
+          existing.addEventListener("load", () => resolve());
+          existing.addEventListener("error", reject);
           return;
         }
         const script = document.createElement("script");
-        script.id = "ffmpeg-script";
+        script.src = src;
         script.crossOrigin = "anonymous";
-        script.src =
-          "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js";
-        script.onload = resolve;
+        script.dataset.src = src;
+        script.onload = () => {
+          script.dataset.loaded = "1";
+          resolve();
+        };
         script.onerror = reject;
         document.body.appendChild(script);
       });
     }
 
+    async function ensureMp4Box() {
+      if (window.MP4Box) return;
+      await loadScript(MP4BOX_URL);
+    }
+
+    // Dipisah lewat `new Function` supaya bundler Next.js tidak ikut
+    // mencoba resolve URL remote ini sebagai module lokal.
+    const dynamicImport = new Function("specifier", "return import(specifier)");
+    let mp4MuxerModPromise = null;
+    function ensureMp4Muxer() {
+      if (!mp4MuxerModPromise) mp4MuxerModPromise = dynamicImport(MP4_MUXER_URL);
+      return mp4MuxerModPromise;
+    }
+
+    // ---------- mp4box helpers ----------
+
+    // Ambil avcC/hvcC (config box) sebagai `description` untuk VideoDecoder,
+    // dan esds (AudioSpecificConfig) untuk AudioDecoder. Pola ini standar
+    // dipakai di contoh resmi WebCodecs + mp4box.js.
+    function getVideoDescription(mp4boxFile, track) {
+      const trak = mp4boxFile.getTrackById(track.id);
+      for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+        const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+        if (box) {
+          const stream = new window.MP4Box.DataStream(
+            undefined,
+            0,
+            window.MP4Box.DataStream.BIG_ENDIAN
+          );
+          box.write(stream);
+          return new Uint8Array(stream.buffer, 8); // buang header box (size+fourcc)
+        }
+      }
+      return undefined;
+    }
+
+    function getAudioDescription(mp4boxFile, track) {
+      try {
+        const trak = mp4boxFile.getTrackById(track.id);
+        for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+          if (entry.esds && entry.esds.esd && entry.esds.esd.descs) {
+            const decoderConfig = entry.esds.esd.descs[0]?.descs?.[0];
+            if (decoderConfig && decoderConfig.data) return decoderConfig.data;
+          }
+        }
+      } catch (e) {
+        console.warn("Gagal ambil audio description:", e);
+      }
+      return undefined;
+    }
+
+    function demuxMp4(file) {
+      return new Promise((resolve, reject) => {
+        const mp4boxFile = window.MP4Box.createFile();
+        const videoSamples = [];
+        const audioSamples = [];
+        let videoTrack = null;
+        let audioTrack = null;
+
+        mp4boxFile.onError = (e) => reject(new Error("Gagal membaca MP4: " + e));
+
+        mp4boxFile.onReady = (info) => {
+          videoTrack = info.videoTracks[0] || null;
+          audioTrack = info.audioTracks[0] || null;
+          if (!videoTrack) {
+            reject(new Error("Tidak ada video track di file ini."));
+            return;
+          }
+          mp4boxFile.setExtractionOptions(videoTrack.id, "video", { nbSamples: Infinity });
+          if (audioTrack) {
+            mp4boxFile.setExtractionOptions(audioTrack.id, "audio", { nbSamples: Infinity });
+          }
+          mp4boxFile.start();
+        };
+
+        mp4boxFile.onSamples = (trackId, ref, samples) => {
+          if (ref === "video") videoSamples.push(...samples);
+          else if (ref === "audio") audioSamples.push(...samples);
+        };
+
+        file
+          .arrayBuffer()
+          .then((buf) => {
+            buf.fileStart = 0;
+            mp4boxFile.appendBuffer(buf);
+            mp4boxFile.flush();
+            // onSamples dipanggil sinkron selama flush/appendBuffer di atas
+            resolve({ mp4boxFile, videoTrack, audioTrack, videoSamples, audioSamples });
+          })
+          .catch(reject);
+      });
+    }
+
+    async function pickVideoCodec(width, height, hardwareAcceleration) {
+      const candidates = ["avc1.640028", "avc1.4d0028", "avc1.42001f"];
+      for (const codec of candidates) {
+        const config = {
+          codec,
+          width,
+          height,
+          hardwareAcceleration,
+        };
+        try {
+          const support = await VideoEncoder.isConfigSupported(config);
+          if (support.supported) return codec;
+        } catch (e) {
+          // lanjut coba kandidat berikutnya
+        }
+      }
+      return null;
+    }
+
+    // ---------- part writer (1 file mp4 output per bagian) ----------
+
+    function createPartWriter({ Mp4Muxer, width, height, videoCodec, bitrate, hasAudio, audioCodec, sampleRate, channels }) {
+      const target = new Mp4Muxer.ArrayBufferTarget();
+      const muxerConfig = {
+        target,
+        fastStart: "in-memory",
+        video: { codec: "avc", width, height },
+      };
+      if (hasAudio) {
+        muxerConfig.audio = { codec: "aac", numberOfChannels: channels, sampleRate };
+      }
+      const muxer = new Mp4Muxer.Muxer(muxerConfig);
+
+      const videoEncoder = new VideoEncoder({
+        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        error: (e) => console.error("VideoEncoder error:", e),
+      });
+      videoEncoder.configure({
+        codec: videoCodec,
+        width,
+        height,
+        bitrate,
+        hardwareAcceleration: "prefer-hardware",
+        bitrateMode: "variable",
+      });
+
+      let audioEncoder = null;
+      if (hasAudio) {
+        audioEncoder = new AudioEncoder({
+          output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+          error: (e) => console.error("AudioEncoder error:", e),
+        });
+        audioEncoder.configure({
+          codec: audioCodec,
+          sampleRate,
+          numberOfChannels: channels,
+          bitrate: 128_000,
+        });
+      }
+
+      let videoFrameCount = 0;
+
+      return {
+        encodeVideoFrame(frame, forceKeyFrame) {
+          videoEncoder.encode(frame, { keyFrame: forceKeyFrame || videoFrameCount === 0 });
+          videoFrameCount++;
+          frame.close();
+        },
+        encodeAudioData(data) {
+          if (audioEncoder) audioEncoder.encode(data);
+          data.close();
+        },
+        async finish() {
+          await videoEncoder.flush();
+          if (audioEncoder) await audioEncoder.flush();
+          muxer.finalize();
+          return new Blob([target.buffer], { type: "video/mp4" });
+        },
+      };
+    }
+
+    // ---------- pipeline utama ----------
+
     async function handleProcessClick() {
       if (!currentFile) return;
+      if (typeof VideoEncoder === "undefined" || typeof VideoDecoder === "undefined") {
+        errorBox.textContent =
+          "Browser ini belum dukung WebCodecs (VideoEncoder/VideoDecoder). Coba pakai Chrome/Edge versi terbaru.";
+        errorBox.classList.remove("hidden");
+        return;
+      }
+
       processBtn.disabled = true;
       errorBox.classList.add("hidden");
       resultPanel.classList.add("hidden");
       partsGrid.innerHTML = "";
 
+      const canvas = document.createElement("canvas");
+      let ctx = null;
+
       try {
-        await ensureFfmpegLoaded();
-        const { createFFmpeg, fetchFile } = window.FFmpeg;
+        setProgress("Menyiapkan mesin video (mp4box + mp4-muxer)…");
+        await ensureMp4Box();
+        const Mp4Muxer = await ensureMp4Muxer();
 
-        if (!ffmpeg) {
-          ffmpeg = createFFmpeg({
-            log: false,
-            corePath:
-              "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.11.0/dist/ffmpeg-core.js",
+        setProgress("Membaca & membongkar MP4…");
+        const { mp4boxFile, videoTrack, audioTrack, videoSamples, audioSamples } =
+          await demuxMp4(currentFile);
+
+        const srcWidth = videoTrack.track_width || videoTrack.video?.width || currentMeta.width;
+        const srcHeight = videoTrack.track_height || videoTrack.video?.height || currentMeta.height;
+        const targetHeight = srcHeight >= 1080 ? 1080 : srcHeight >= 720 ? srcHeight : 720;
+        let targetWidth = Math.round((srcWidth * targetHeight) / srcHeight);
+        if (targetWidth % 2 !== 0) targetWidth += 1;
+        const outHeight = targetHeight % 2 !== 0 ? targetHeight + 1 : targetHeight;
+
+        canvas.width = targetWidth;
+        canvas.height = outHeight;
+        ctx = canvas.getContext("2d");
+
+        const bitrate =
+          outHeight >= 1080 ? 6_000_000 : outHeight >= 720 ? 4_000_000 : 2_500_000;
+
+        setProgress("Memilih encoder video (coba akses GPU)…");
+        const videoCodec = await pickVideoCodec(targetWidth, outHeight, "prefer-hardware");
+        if (!videoCodec) {
+          throw new Error(
+            "Tidak ada encoder H.264 yang didukung browser ini (hardware maupun software)."
+          );
+        }
+        // Cek apakah kandidat yang kepilih benar-benar jalan di GPU atau jatuh ke software,
+        // sekadar info di progress label — proses tetap lanjut walau fallback ke software.
+        let usingHardware = true;
+        try {
+          const support = await VideoEncoder.isConfigSupported({
+            codec: videoCodec,
+            width: targetWidth,
+            height: outHeight,
+            hardwareAcceleration: "prefer-hardware",
           });
-        }
-        if (!ffmpegReady) {
-          setProgress("Menyiapkan mesin video (sekali saja)…");
-          await ffmpeg.load();
-          ffmpegReady = true;
+          usingHardware = !!support.supported;
+        } catch (e) {
+          usingHardware = false;
         }
 
-        const ext = (currentFile.name.split(".").pop() || "mp4").toLowerCase();
-        const inputName = `input.${ext}`;
-        setProgress("Membaca file…");
-        ffmpeg.FS("writeFile", inputName, await fetchFile(currentFile));
+        const videoDescription = getVideoDescription(mp4boxFile, videoTrack);
+        const videoDecoderConfig = {
+          codec: videoTrack.codec,
+          codedWidth: srcWidth,
+          codedHeight: srcHeight,
+          description: videoDescription,
+          hardwareAcceleration: "prefer-hardware",
+        };
+
+        let hasAudio = false;
+        let audioSampleRate = 48000;
+        let audioChannels = 2;
+        const audioCodecStr = "mp4a.40.2";
+        let audioDescription;
+        if (audioTrack) {
+          try {
+            audioSampleRate = audioTrack.audio?.sample_rate || audioTrack.samplerate || 48000;
+            audioChannels = audioTrack.audio?.channel_count || audioTrack.channel_count || 2;
+            audioDescription = getAudioDescription(mp4boxFile, audioTrack);
+            const audioSupport = await AudioEncoder.isConfigSupported({
+              codec: audioCodecStr,
+              sampleRate: audioSampleRate,
+              numberOfChannels: audioChannels,
+              bitrate: 128_000,
+            });
+            hasAudio = !!audioSupport.supported;
+          } catch (e) {
+            console.warn("Audio tidak didukung, lanjut tanpa audio:", e);
+            hasAudio = false;
+          }
+        }
 
         const duration = currentMeta.duration;
         const totalParts =
           duration > SPLIT_SECONDS ? Math.ceil(duration / SPLIT_SECONDS) : 1;
-        const targetHeight =
-          currentMeta.height >= 1080
-            ? 1080
-            : currentMeta.height >= 720
-            ? currentMeta.height
-            : 720;
 
-        ffmpeg.setProgress(({ ratio }) => {
-          if (ratio >= 0 && ratio <= 1) {
-            const overall = (partIndex + ratio) / totalParts;
-            progressLabel.textContent =
-              totalParts > 1
-                ? `Memproses bagian ${partIndex + 1}/${totalParts} — ${Math.round(
-                    overall * 100
-                  )}%`
-                : `Memproses video — ${Math.round(ratio * 100)}%`;
-          }
-        });
+        const partPromises = [];
+        let currentPart = null;
+        let currentPartIndex = -1;
+        let currentPartStartUs = 0;
 
-        const outputs = [];
-        for (let i = 0; i < totalParts; i++) {
-          partIndex = i;
-          const start = i * SPLIT_SECONDS;
-          const dur = Math.min(SPLIT_SECONDS, duration - start);
-          const outName = totalParts > 1 ? `output_part${i + 1}.mp4` : "output.mp4";
-
-          const args = [];
-          if (totalParts > 1) {
-            args.push("-ss", String(start), "-t", String(dur));
-          }
-          args.push(
-            "-i",
-            inputName,
-            "-vf",
-            `scale=-2:${targetHeight}`,
-            "-c:v",
-            "libx264",
-            "-threads",
-            String(Math.max(1, navigator.hardwareConcurrency || 4)),
-            "-preset",
-            "veryfast",
-            "-crf",
-            "19",
-            "-maxrate",
-            "6M",
-            "-bufsize",
-            "12M",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            outName
-          );
-          await ffmpeg.run(...args);
-          const data = ffmpeg.FS("readFile", outName);
-          const blob = new Blob([data.buffer], { type: "video/mp4" });
-          outputs.push({ name: outName, blob, index: i + 1, dur });
-          ffmpeg.FS("unlink", outName);
+        function startPart(index) {
+          currentPartIndex = index;
+          currentPartStartUs = index * SPLIT_SECONDS * 1_000_000;
+          currentPart = createPartWriter({
+            Mp4Muxer,
+            width: targetWidth,
+            height: outHeight,
+            videoCodec,
+            bitrate,
+            hasAudio,
+            audioCodec: audioCodecStr,
+            sampleRate: audioSampleRate,
+            channels: audioChannels,
+          });
         }
-        ffmpeg.FS("unlink", inputName);
+
+        function finishCurrentPart() {
+          if (!currentPart) return;
+          const part = currentPart;
+          const index = currentPartIndex;
+          partPromises.push(part.finish().then((blob) => ({ blob, index })));
+          currentPart = null;
+        }
+
+        function partIndexForUs(tUs) {
+          const idx = Math.floor(tUs / (SPLIT_SECONDS * 1_000_000));
+          return Math.min(totalParts - 1, Math.max(0, idx));
+        }
+
+        function routeVideoFrame(frame) {
+          const tUs = frame.timestamp;
+          const idx = partIndexForUs(tUs);
+          if (idx !== currentPartIndex) {
+            finishCurrentPart();
+            startPart(idx);
+          }
+          const relativeUs = tUs - currentPartStartUs;
+
+          ctx.drawImage(frame, 0, 0, targetWidth, outHeight);
+          const scaled = new VideoFrame(canvas, {
+            timestamp: Math.max(0, relativeUs),
+            duration: frame.duration || undefined,
+          });
+          currentPart.encodeVideoFrame(scaled, relativeUs === 0);
+          frame.close();
+
+          const overall = (idx + Math.min(1, relativeUs / (SPLIT_SECONDS * 1_000_000))) / totalParts;
+          progressLabel.textContent =
+            totalParts > 1
+              ? `Memproses bagian ${idx + 1}/${totalParts} — ${Math.round(overall * 100)}% (GPU)`
+              : `Memproses video — ${Math.round((tUs / 1e6 / duration) * 100)}% (GPU)`;
+        }
+
+        function routeAudioData(data) {
+          const tUs = data.timestamp;
+          const idx = partIndexForUs(tUs);
+          if (idx !== currentPartIndex) {
+            // audio nyampe setelah video pindah part: cukup buang sample ini,
+            // part berikutnya akan dibuka oleh video frame berikutnya.
+            data.close();
+            return;
+          }
+          currentPart.encodeAudioData(data);
+        }
+
+        setProgress("Mendekode & mengencode video…");
+
+        const videoDecoder = new VideoDecoder({
+          output: routeVideoFrame,
+          error: (e) => console.error("VideoDecoder error:", e),
+        });
+        videoDecoder.configure(videoDecoderConfig);
+
+        let audioDecoder = null;
+        if (hasAudio) {
+          audioDecoder = new AudioDecoder({
+            output: routeAudioData,
+            error: (e) => console.error("AudioDecoder error:", e),
+          });
+          try {
+            audioDecoder.configure({
+              codec: audioCodecStr,
+              sampleRate: audioSampleRate,
+              numberOfChannels: audioChannels,
+              description: audioDescription,
+            });
+          } catch (e) {
+            console.warn("Gagal configure AudioDecoder, lanjut tanpa audio:", e);
+            hasAudio = false;
+            audioDecoder = null;
+          }
+        }
+
+        startPart(0);
+
+        for (const sample of videoSamples) {
+          const chunk = new EncodedVideoChunk({
+            type: sample.is_sync ? "key" : "delta",
+            timestamp: Math.round((sample.cts * 1_000_000) / sample.timescale),
+            duration: Math.round((sample.duration * 1_000_000) / sample.timescale),
+            data: sample.data,
+          });
+          videoDecoder.decode(chunk);
+        }
+        await videoDecoder.flush();
+        videoDecoder.close();
+
+        if (hasAudio && audioDecoder) {
+          for (const sample of audioSamples) {
+            const chunk = new EncodedAudioChunk({
+              type: sample.is_sync ? "key" : "delta",
+              timestamp: Math.round((sample.cts * 1_000_000) / sample.timescale),
+              duration: Math.round((sample.duration * 1_000_000) / sample.timescale),
+              data: sample.data,
+            });
+            try {
+              audioDecoder.decode(chunk);
+            } catch (e) {
+              console.warn("Lewati sample audio bermasalah:", e);
+            }
+          }
+          try {
+            await audioDecoder.flush();
+          } catch (e) {
+            console.warn("Audio flush error:", e);
+          }
+          audioDecoder.close();
+        }
+
+        finishCurrentPart();
+        setProgress(
+          usingHardware
+            ? "Menyelesaikan file (encoder GPU)…"
+            : "Menyelesaikan file (fallback software, GPU tidak tersedia di browser ini)…"
+        );
+
+        const outputs = await Promise.all(partPromises);
+        outputs.sort((a, b) => a.index - b.index);
 
         progressRow.classList.add("hidden");
         resultPanel.classList.remove("hidden");
-        outputs.forEach((o) => {
-          const url = URL.createObjectURL(o.blob);
+        outputs.forEach(({ blob, index }) => {
+          const url = URL.createObjectURL(blob);
+          const partDur =
+            index === totalParts - 1 ? duration - index * SPLIT_SECONDS : SPLIT_SECONDS;
           const card = document.createElement("div");
           card.className = "part";
           card.innerHTML = `
@@ -252,12 +587,12 @@ export default function Page() {
             <div class="part-body">
               <div class="part-title">
                 <span>${
-                  totalParts > 1 ? `Bagian ${o.index} dari ${totalParts}` : "Video jadi"
+                  totalParts > 1 ? `Bagian ${index + 1} dari ${totalParts}` : "Video jadi"
                 }</span>
-                <span>${fmtTime(o.dur)} · ${fmtSize(o.blob.size)}</span>
+                <span>${fmtTime(partDur)} · ${fmtSize(blob.size)}</span>
               </div>
               <a class="download" href="${url}" download="status-hd-${
-            totalParts > 1 ? "part" + o.index + "-" : ""
+            totalParts > 1 ? "part" + (index + 1) + "-" : ""
           }${currentFile.name.replace(/\.[^.]+$/, "")}.mp4">
                 Unduh Video
               </a>
@@ -269,7 +604,7 @@ export default function Page() {
         errorBox.textContent =
           "Gagal memproses video: " +
           (err && err.message ? err.message : String(err)) +
-          ". Coba video lain atau muat ulang halaman.";
+          ". Pastikan file MP4 dan browser mendukung WebCodecs (Chrome/Edge terbaru disarankan).";
         errorBox.classList.remove("hidden");
         progressRow.classList.add("hidden");
       } finally {
@@ -293,12 +628,14 @@ export default function Page() {
   return (
     <div className="wrap">
       <header>
-        <div className="eyebrow">Diproses di perangkatmu — tidak diunggah ke server</div>
+        <div className="eyebrow">Diproses di perangkatmu (GPU) — tidak diunggah ke server</div>
         <h1>Status HD</h1>
         <p>
           Perbaiki video sebelum jadi Status WhatsApp. <b>Status HD</b> mengatur ulang
           bitrate dan resolusi supaya kompresi WhatsApp nggak bikin video pecah — dan
           otomatis membagi video ke beberapa bagian kalau lebih dari 1 menit 30 detik.
+          Proses encode/decode video lewat WebCodecs, otomatis pakai GPU kalau
+          browser & perangkat mendukung.
         </p>
       </header>
 
@@ -307,9 +644,9 @@ export default function Page() {
           <span></span><span></span><span></span><span></span>
           <span></span><span></span><span></span><span></span>
         </div>
-        <div className="dz-title">Taruh video di sini, atau ketuk untuk memilih file</div>
-        <div className="dz-sub">MP4, MOV, MKV, WebM — semua diproses lokal di browser</div>
-        <input type="file" id="fileInput" accept="video/*" />
+        <div className="dz-title">Taruh video MP4 di sini, atau ketuk untuk memilih file</div>
+        <div className="dz-sub">MP4 saja (versi GPU) — diproses lokal di browser</div>
+        <input type="file" id="fileInput" accept="video/mp4" />
       </div>
 
       <div className="panel hidden" id="sourcePanel">
@@ -326,7 +663,7 @@ export default function Page() {
         </div>
         <div className="splitnote hidden" id="splitNote"></div>
         <div style={{ marginTop: 18 }}>
-          <button className="primary" id="processBtn">Proses Video</button>
+          <button className="primary" id="processBtn">Proses Video (GPU)</button>
         </div>
         <div className="progress-row hidden" id="progressRow">
           <span className="progress-label" id="progressLabel">Menyiapkan mesin video…</span>
@@ -350,7 +687,7 @@ export default function Page() {
         <div className="parts" id="partsGrid"></div>
       </div>
 
-      <div className="foot">status-hd · pemrosesan lokal via ffmpeg.wasm</div>
+      <div className="foot">status-hd · pemrosesan lokal via WebCodecs (GPU) + mp4box.js + mp4-muxer</div>
     </div>
   );
 }
