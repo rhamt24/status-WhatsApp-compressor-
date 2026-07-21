@@ -9,7 +9,7 @@ const MP4_MUXER_URL = "https://esm.run/mp4-muxer@5.2.2";
 export default function Page() {
   useEffect(() => {
     let currentFile = null;
-    let currentFileBuffer = null; // ArrayBuffer cache — dibaca sekali saat file dipilih
+    let currentFileBuffer = null; 
     let currentFileReadError = null;
     let currentMeta = { duration: 0, width: 0, height: 0 };
 
@@ -61,10 +61,6 @@ export default function Page() {
       partsGrid.innerHTML = "";
       progressRow.classList.add("hidden");
 
-      // Baca isi file sekali sekarang dan simpan di memori. Di Android, File
-      // yang berasal dari Galeri/Google Photos kadang cuma bisa dibaca sekali;
-      // kalau kita nunggu sampai tombol "Proses" diklik (apalagi kalau user
-      // klik ulang setelah error), pembacaan kedua bisa ditolak sistem.
       file
         .arrayBuffer()
         .then((buf) => {
@@ -179,8 +175,6 @@ export default function Page() {
       await loadScript(MP4BOX_URL);
     }
 
-    // Dipisah lewat `new Function` supaya bundler Next.js tidak ikut
-    // mencoba resolve URL remote ini sebagai module lokal.
     const dynamicImport = new Function("specifier", "return import(specifier)");
     let mp4MuxerModPromise = null;
     function ensureMp4Muxer() {
@@ -190,17 +184,11 @@ export default function Page() {
 
     // ---------- mp4box helpers ----------
 
-    // Ambil avcC/hvcC (config box) sebagai `description` untuk VideoDecoder,
-    // dan esds (AudioSpecificConfig) untuk AudioDecoder. Pola ini standar
-    // dipakai di contoh resmi WebCodecs + mp4box.js.
     function getVideoDescription(mp4boxFile, track) {
       const trak = mp4boxFile.getTrackById(track.id);
       for (const entry of trak.mdia.minf.stbl.stsd.entries) {
         const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
         if (box) {
-          // DataStream adalah global tersendiri yang dibawa mp4box.all.min.js
-          // (bukan properti window.MP4Box), tapi jaga-jaga untuk versi lain
-          // yang menaruhnya di window.MP4Box.DataStream.
           const DS = window.DataStream || window.MP4Box?.DataStream;
           if (!DS) {
             throw new Error(
@@ -209,7 +197,7 @@ export default function Page() {
           }
           const stream = new DS(undefined, 0, DS.BIG_ENDIAN);
           box.write(stream);
-          return new Uint8Array(stream.buffer, 8); // buang header box (size+fourcc)
+          return new Uint8Array(stream.buffer, 8); 
         }
       }
       return undefined;
@@ -260,13 +248,10 @@ export default function Page() {
         };
 
         try {
-          // Salin (slice) supaya buffer cache asli tidak ikut ter-detach/berubah
-          // dan bisa dipakai lagi kalau proses di-retry.
           const buf = arrayBuffer.slice(0);
           buf.fileStart = 0;
           mp4boxFile.appendBuffer(buf);
           mp4boxFile.flush();
-          // onSamples dipanggil sinkron selama flush/appendBuffer di atas
           resolve({ mp4boxFile, videoTrack, audioTrack, videoSamples, audioSamples });
         } catch (e) {
           reject(e);
@@ -274,9 +259,6 @@ export default function Page() {
       });
     }
 
-    // Sebuah codec (Video/AudioDecoder/Encoder) bisa menutup dirinya sendiri
-    // kalau terjadi error internal (state jadi "closed"). Memanggil .close()
-    // lagi setelah itu akan melempar exception, jadi selalu dicek dulu.
     function safeCloseCodec(codec) {
       try {
         if (codec && codec.state !== "closed") codec.close();
@@ -318,10 +300,37 @@ export default function Page() {
       }
       const muxer = new Mp4Muxer.Muxer(muxerConfig);
 
+      let firstVideoChunk = true;
+
       const videoEncoder = new VideoEncoder({
-        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        output: (chunk, meta) => {
+          // Clone meta object untuk menghindari mutasi objek read-only dari browser
+          let safeMeta = meta ? { ...meta } : {};
+
+          // FIX 1: Cegah crash jika browser gagal mengirimkan decoderConfig di chunk pertama
+          if (firstVideoChunk) {
+            firstVideoChunk = false;
+            if (!safeMeta.decoderConfig) {
+              safeMeta.decoderConfig = {
+                codec: videoCodec,
+                codedWidth: width,
+                codedHeight: height,
+                description: new Uint8Array(0), // Dummy description aman untuk mp4-muxer
+              };
+            }
+          }
+
+          // FIX 2: Hapus colorSpace jika secara eksplisit bernilai null supaya mp4-muxer tidak crash
+          if (safeMeta.decoderConfig && safeMeta.decoderConfig.colorSpace === null) {
+            safeMeta.decoderConfig = { ...safeMeta.decoderConfig };
+            delete safeMeta.decoderConfig.colorSpace;
+          }
+
+          muxer.addVideoChunk(chunk, safeMeta);
+        },
         error: (e) => console.error("VideoEncoder error:", e),
       });
+
       videoEncoder.configure({
         codec: videoCodec,
         width,
@@ -430,8 +439,7 @@ export default function Page() {
             "Tidak ada encoder H.264 yang didukung browser ini (hardware maupun software)."
           );
         }
-        // Cek apakah kandidat yang kepilih benar-benar jalan di GPU atau jatuh ke software,
-        // sekadar info di progress label — proses tetap lanjut walau fallback ke software.
+        
         let usingHardware = true;
         try {
           const support = await VideoEncoder.isConfigSupported({
@@ -543,8 +551,6 @@ export default function Page() {
           const tUs = data.timestamp;
           const idx = partIndexForUs(tUs);
           if (idx !== currentPartIndex) {
-            // audio nyampe setelah video pindah part: cukup buang sample ini,
-            // part berikutnya akan dibuka oleh video frame berikutnya.
             data.close();
             return;
           }
@@ -595,7 +601,7 @@ export default function Page() {
 
         if (hasAudio && audioDecoder) {
           for (const sample of audioSamples) {
-            if (audioDecoder.state === "closed") break; // codec sudah menutup diri sendiri karena error
+            if (audioDecoder.state === "closed") break; 
             const chunk = new EncodedAudioChunk({
               type: sample.is_sync ? "key" : "delta",
               timestamp: Math.round((sample.cts * 1_000_000) / sample.timescale),
