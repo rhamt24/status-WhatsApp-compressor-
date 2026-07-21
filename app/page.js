@@ -135,6 +135,7 @@ export default function Page() {
         }
         const script = document.createElement("script");
         script.id = "ffmpeg-script";
+        script.crossOrigin = "anonymous";
         script.src =
           "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js";
         script.onload = resolve;
