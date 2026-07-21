@@ -304,10 +304,21 @@ export default function Page() {
 
       const videoEncoder = new VideoEncoder({
         output: (chunk, meta) => {
-          // Clone meta object untuk menghindari mutasi objek read-only dari browser
-          let safeMeta = meta ? { ...meta } : {};
+          let safeMeta = {};
+          
+          if (meta) {
+            safeMeta = { ...meta };
+            
+            if (safeMeta.decoderConfig === null) {
+              delete safeMeta.decoderConfig;
+            } else if (safeMeta.decoderConfig) {
+              safeMeta.decoderConfig = { ...safeMeta.decoderConfig };
+              if (safeMeta.decoderConfig.colorSpace === null) {
+                delete safeMeta.decoderConfig.colorSpace;
+              }
+            }
+          }
 
-          // FIX 1: Cegah crash jika browser gagal mengirimkan decoderConfig di chunk pertama
           if (firstVideoChunk) {
             firstVideoChunk = false;
             if (!safeMeta.decoderConfig) {
@@ -315,18 +326,16 @@ export default function Page() {
                 codec: videoCodec,
                 codedWidth: width,
                 codedHeight: height,
-                description: new Uint8Array(0), // Dummy description aman untuk mp4-muxer
+                description: new Uint8Array(0), 
               };
             }
           }
 
-          // FIX 2: Hapus colorSpace jika secara eksplisit bernilai null supaya mp4-muxer tidak crash
-          if (safeMeta.decoderConfig && safeMeta.decoderConfig.colorSpace === null) {
-            safeMeta.decoderConfig = { ...safeMeta.decoderConfig };
-            delete safeMeta.decoderConfig.colorSpace;
+          try {
+            muxer.addVideoChunk(chunk, safeMeta);
+          } catch (err) {
+            console.error("Gagal menambahkan video chunk:", err);
           }
-
-          muxer.addVideoChunk(chunk, safeMeta);
         },
         error: (e) => console.error("VideoEncoder error:", e),
       });
@@ -372,7 +381,7 @@ export default function Page() {
           if (audioEncoder) {
             await audioEncoder.flush();
             safeCloseCodec(audioEncoder);
-          }
+        }
           muxer.finalize();
           return new Blob([target.buffer], { type: "video/mp4" });
         },
@@ -411,21 +420,46 @@ export default function Page() {
             currentFileBuffer = bufferToUse;
           } catch (e) {
             throw new Error(
-              "File videonya sudah tidak bisa diakses lagi (izin dari sistem hilang, sering terjadi kalau file dipilih dari Galeri/Google Photos di Android). Silakan pilih ulang videonya lewat tombol upload, lalu langsung klik Proses tanpa berpindah aplikasi dulu."
+              "File videonya sudah tidak bisa diakses lagi. Silakan pilih ulang videonya lalu klik Proses tanpa berpindah aplikasi."
             );
           }
         }
         const { mp4boxFile, videoTrack, audioTrack, videoSamples, audioSamples } =
           await demuxMp4(bufferToUse);
 
-        const srcWidth = videoTrack.track_width || videoTrack.video?.width || currentMeta.width;
-        const srcHeight = videoTrack.track_height || videoTrack.video?.height || currentMeta.height;
-        const targetHeight = srcHeight >= 1080 ? 1080 : srcHeight >= 720 ? srcHeight : 720;
-        let targetWidth = Math.round((srcWidth * targetHeight) / srcHeight);
-        if (targetWidth % 2 !== 0) targetWidth += 1;
-        const outHeight = targetHeight % 2 !== 0 ? targetHeight + 1 : targetHeight;
+        // DETEKSI RESOLUSI & ROTASI MATRIKS 
+        const rawSrcWidth = videoTrack.track_width || videoTrack.video?.width || currentMeta.width;
+        const rawSrcHeight = videoTrack.track_height || videoTrack.video?.height || currentMeta.height;
 
-        canvas.width = targetWidth;
+        let rotation = 0;
+        if (videoTrack.matrix) {
+          const a = videoTrack.matrix[0];
+          const b = videoTrack.matrix[1];
+          if (a === 0 && b === 65536) rotation = 90;
+          else if (a === -65536) rotation = 180;
+          else if (a === 0 && b === -65536) rotation = 270;
+        }
+
+        // Fallback jika orientasi di matriks kosong tapi pemutar video mengenali sebagai potret
+        if (rotation === 0) {
+           const metaPortrait = currentMeta.height > currentMeta.width;
+           const rawPortrait = rawSrcHeight > rawSrcWidth;
+           if (metaPortrait !== rawPortrait) {
+               rotation = 90; // Paksa orientasi ditukar
+           }
+        }
+
+        const isRotated = rotation === 90 || rotation === 270;
+        // Jika diputar 90/270, lebar & tinggi saat ditayangkan itu saling tukar
+        const displayWidth = isRotated ? rawSrcHeight : rawSrcWidth;
+        const displayHeight = isRotated ? rawSrcWidth : rawSrcHeight;
+
+        const targetDisplayHeight = displayHeight >= 1080 ? 1080 : displayHeight >= 720 ? displayHeight : 720;
+        let targetDisplayWidth = Math.round((displayWidth * targetDisplayHeight) / displayHeight);
+        if (targetDisplayWidth % 2 !== 0) targetDisplayWidth += 1;
+        const outHeight = targetDisplayHeight % 2 !== 0 ? targetDisplayHeight + 1 : targetDisplayHeight;
+
+        canvas.width = targetDisplayWidth;
         canvas.height = outHeight;
         ctx = canvas.getContext("2d");
 
@@ -433,7 +467,7 @@ export default function Page() {
           outHeight >= 1080 ? 6_000_000 : outHeight >= 720 ? 4_000_000 : 2_500_000;
 
         setProgress("Memilih encoder video (coba akses GPU)…");
-        const videoCodec = await pickVideoCodec(targetWidth, outHeight, "prefer-hardware");
+        const videoCodec = await pickVideoCodec(targetDisplayWidth, outHeight, "prefer-hardware");
         if (!videoCodec) {
           throw new Error(
             "Tidak ada encoder H.264 yang didukung browser ini (hardware maupun software)."
@@ -444,7 +478,7 @@ export default function Page() {
         try {
           const support = await VideoEncoder.isConfigSupported({
             codec: videoCodec,
-            width: targetWidth,
+            width: targetDisplayWidth,
             height: outHeight,
             hardwareAcceleration: "prefer-hardware",
           });
@@ -454,10 +488,11 @@ export default function Page() {
         }
 
         const videoDescription = getVideoDescription(mp4boxFile, videoTrack);
+        // Note: Decoder membaca file aslinya sebelum diputar (rawWidth & rawHeight)
         const videoDecoderConfig = {
           codec: videoTrack.codec,
-          codedWidth: srcWidth,
-          codedHeight: srcHeight,
+          codedWidth: rawSrcWidth,
+          codedHeight: rawSrcHeight,
           description: videoDescription,
           hardwareAcceleration: "prefer-hardware",
         };
@@ -499,7 +534,7 @@ export default function Page() {
           currentPartStartUs = index * SPLIT_SECONDS * 1_000_000;
           currentPart = createPartWriter({
             Mp4Muxer,
-            width: targetWidth,
+            width: targetDisplayWidth,
             height: outHeight,
             videoCodec,
             bitrate,
@@ -532,7 +567,25 @@ export default function Page() {
           }
           const relativeUs = tUs - currentPartStartUs;
 
-          ctx.drawImage(frame, 0, 0, targetWidth, outHeight);
+          // Menggambar frame dengan penyesuaian matriks/rotasi
+          ctx.save();
+          if (rotation === 90) {
+            ctx.translate(canvas.width, 0);
+            ctx.rotate(Math.PI / 2);
+            ctx.drawImage(frame, 0, 0, canvas.height, canvas.width);
+          } else if (rotation === 180) {
+            ctx.translate(canvas.width, canvas.height);
+            ctx.rotate(Math.PI);
+            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          } else if (rotation === 270) {
+            ctx.translate(0, canvas.height);
+            ctx.rotate(-Math.PI / 2);
+            ctx.drawImage(frame, 0, 0, canvas.height, canvas.width);
+          } else {
+            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          }
+          ctx.restore();
+
           const scaled = new VideoFrame(canvas, {
             timestamp: Math.max(0, relativeUs),
             duration: frame.duration || undefined,
@@ -636,20 +689,29 @@ export default function Page() {
 
         progressRow.classList.add("hidden");
         resultPanel.classList.remove("hidden");
+        
+        // MENCETAK KARTU OUTPUT & STATISTIK BARU
         outputs.forEach(({ blob, index }) => {
           const url = URL.createObjectURL(blob);
           const partDur =
             index === totalParts - 1 ? duration - index * SPLIT_SECONDS : SPLIT_SECONDS;
+            
+          // Hitung bitrate file yang baru jadi (Mbit/s)
+          const resBitrate = ((blob.size * 8) / partDur / 1_000_000).toFixed(1);
+
           const card = document.createElement("div");
           card.className = "part";
           card.innerHTML = `
             <video src="${url}" controls></video>
             <div class="part-body">
-              <div class="part-title">
-                <span>${
+              <div class="part-title" style="margin-bottom: 4px;">
+                <span style="font-weight: 600;">${
                   totalParts > 1 ? `Bagian ${index + 1} dari ${totalParts}` : "Video jadi"
                 }</span>
-                <span>${fmtTime(partDur)} · ${fmtSize(blob.size)}</span>
+              </div>
+              <div style="font-size: 0.85em; color: #555; line-height: 1.4; margin-bottom: 12px;">
+                <div><b>Durasi:</b> ${fmtTime(partDur)} &nbsp;·&nbsp; <b>Ukuran:</b> ${fmtSize(blob.size)}</div>
+                <div><b>Resolusi:</b> ${canvas.width}×${canvas.height} &nbsp;·&nbsp; <b>Bitrate:</b> ${resBitrate} Mbps</div>
               </div>
               <a class="download" href="${url}" download="status-hd-${
             totalParts > 1 ? "part" + (index + 1) + "-" : ""
