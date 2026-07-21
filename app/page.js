@@ -159,7 +159,7 @@ export default function Page() {
           ffmpeg = createFFmpeg({
             log: false,
             corePath:
-              "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js",
+              "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.11.0/dist/ffmpeg-core.js",
           });
         }
         if (!ffmpegReady) {
@@ -213,6 +213,8 @@ export default function Page() {
             `scale=-2:${targetHeight}`,
             "-c:v",
             "libx264",
+            "-threads",
+            String(Math.max(1, navigator.hardwareConcurrency || 4)),
             "-preset",
             "veryfast",
             "-crf",
