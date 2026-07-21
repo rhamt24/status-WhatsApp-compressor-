@@ -9,7 +9,7 @@ const MP4_MUXER_URL = "https://esm.run/mp4-muxer@5.2.2";
 export default function Page() {
   useEffect(() => {
     let currentFile = null;
-    let currentFileBuffer = null; 
+    let currentFileBuffer = null; // ArrayBuffer cache — dibaca sekali saat file dipilih
     let currentFileReadError = null;
     let currentMeta = { duration: 0, width: 0, height: 0 };
 
@@ -61,6 +61,10 @@ export default function Page() {
       partsGrid.innerHTML = "";
       progressRow.classList.add("hidden");
 
+      // Baca isi file sekali sekarang dan simpan di memori. Di Android, File
+      // yang berasal dari Galeri/Google Photos kadang cuma bisa dibaca sekali;
+      // kalau kita nunggu sampai tombol "Proses" diklik (apalagi kalau user
+      // klik ulang setelah error), pembacaan kedua bisa ditolak sistem.
       file
         .arrayBuffer()
         .then((buf) => {
@@ -175,6 +179,8 @@ export default function Page() {
       await loadScript(MP4BOX_URL);
     }
 
+    // Dipisah lewat `new Function` supaya bundler Next.js tidak ikut
+    // mencoba resolve URL remote ini sebagai module lokal.
     const dynamicImport = new Function("specifier", "return import(specifier)");
     let mp4MuxerModPromise = null;
     function ensureMp4Muxer() {
@@ -184,11 +190,17 @@ export default function Page() {
 
     // ---------- mp4box helpers ----------
 
+    // Ambil avcC/hvcC (config box) sebagai `description` untuk VideoDecoder,
+    // dan esds (AudioSpecificConfig) untuk AudioDecoder. Pola ini standar
+    // dipakai di contoh resmi WebCodecs + mp4box.js.
     function getVideoDescription(mp4boxFile, track) {
       const trak = mp4boxFile.getTrackById(track.id);
       for (const entry of trak.mdia.minf.stbl.stsd.entries) {
         const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
         if (box) {
+          // DataStream adalah global tersendiri yang dibawa mp4box.all.min.js
+          // (bukan properti window.MP4Box), tapi jaga-jaga untuk versi lain
+          // yang menaruhnya di window.MP4Box.DataStream.
           const DS = window.DataStream || window.MP4Box?.DataStream;
           if (!DS) {
             throw new Error(
@@ -197,7 +209,7 @@ export default function Page() {
           }
           const stream = new DS(undefined, 0, DS.BIG_ENDIAN);
           box.write(stream);
-          return new Uint8Array(stream.buffer, 8); 
+          return new Uint8Array(stream.buffer, 8); // buang header box (size+fourcc)
         }
       }
       return undefined;
@@ -248,10 +260,13 @@ export default function Page() {
         };
 
         try {
+          // Salin (slice) supaya buffer cache asli tidak ikut ter-detach/berubah
+          // dan bisa dipakai lagi kalau proses di-retry.
           const buf = arrayBuffer.slice(0);
           buf.fileStart = 0;
           mp4boxFile.appendBuffer(buf);
           mp4boxFile.flush();
+          // onSamples dipanggil sinkron selama flush/appendBuffer di atas
           resolve({ mp4boxFile, videoTrack, audioTrack, videoSamples, audioSamples });
         } catch (e) {
           reject(e);
@@ -259,6 +274,9 @@ export default function Page() {
       });
     }
 
+    // Sebuah codec (Video/AudioDecoder/Encoder) bisa menutup dirinya sendiri
+    // kalau terjadi error internal (state jadi "closed"). Memanggil .close()
+    // lagi setelah itu akan melempar exception, jadi selalu dicek dulu.
     function safeCloseCodec(codec) {
       try {
         if (codec && codec.state !== "closed") codec.close();
@@ -267,34 +285,20 @@ export default function Page() {
       }
     }
 
-    async function pickVideoCodec(width, height) {
-      const candidates = [
-        "avc1.640028", 
-        "avc1.4d0028", 
-        "avc1.42001f", 
-        "avc1.42e01f", 
-        "avc1.4d401e", 
-        "avc1.42001e", 
-        "avc1.420015"  
-      ];
-      
-      const accelOptions = ["prefer-hardware", "no-preference"];
-
-      for (const accel of accelOptions) {
-        for (const codec of candidates) {
-          try {
-            const support = await VideoEncoder.isConfigSupported({ 
-              codec, 
-              width, 
-              height, 
-              hardwareAcceleration: accel 
-            });
-            if (support.supported) {
-              return { codec, hwAccel: accel };
-            }
-          } catch (e) {
-            // Lanjut ke kandidat berikutnya
-          }
+    async function pickVideoCodec(width, height, hardwareAcceleration) {
+      const candidates = ["avc1.640028", "avc1.4d0028", "avc1.42001f"];
+      for (const codec of candidates) {
+        const config = {
+          codec,
+          width,
+          height,
+          hardwareAcceleration,
+        };
+        try {
+          const support = await VideoEncoder.isConfigSupported(config);
+          if (support.supported) return codec;
+        } catch (e) {
+          // lanjut coba kandidat berikutnya
         }
       }
       return null;
@@ -302,7 +306,7 @@ export default function Page() {
 
     // ---------- part writer (1 file mp4 output per bagian) ----------
 
-    function createPartWriter({ Mp4Muxer, width, height, videoCodec, hwAccel, bitrate, hasAudio, audioCodec, sampleRate, channels }) {
+    function createPartWriter({ Mp4Muxer, width, height, videoCodec, bitrate, hasAudio, audioCodec, sampleRate, channels }) {
       const target = new Mp4Muxer.ArrayBufferTarget();
       const muxerConfig = {
         target,
@@ -314,62 +318,16 @@ export default function Page() {
       }
       const muxer = new Mp4Muxer.Muxer(muxerConfig);
 
-      let firstVideoChunk = true;
-
       const videoEncoder = new VideoEncoder({
-        output: (chunk, meta) => {
-          // FIX PAMUNGKAS: Jangan pernah percaya/menyalin (spread) objek meta dari browser!
-          // Kita akan merakit objek metadata yang 100% baru dan bersih.
-          let safeMeta = {};
-          let validDecoderConfig = null;
-
-          if (meta && meta.decoderConfig) {
-            // Ambil hanya properti dasar
-            validDecoderConfig = {
-              codec: meta.decoderConfig.codec || videoCodec,
-              codedWidth: meta.decoderConfig.codedWidth || width,
-              codedHeight: meta.decoderConfig.codedHeight || height,
-            };
-            
-            // Pasang description (jika ada)
-            if (meta.decoderConfig.description) {
-              validDecoderConfig.description = meta.decoderConfig.description;
-            }
-            
-            // Pasang colorSpace HANYA jika nilainya benar-benar objek (bukan null)
-            if (meta.decoderConfig.colorSpace) {
-              validDecoderConfig.colorSpace = meta.decoderConfig.colorSpace;
-            }
-          }
-
-          // Mp4Muxer butuh decoderConfig di chunk pertama
-          if (firstVideoChunk) {
-            firstVideoChunk = false;
-            safeMeta.decoderConfig = validDecoderConfig || {
-              codec: videoCodec,
-              codedWidth: width,
-              codedHeight: height,
-              description: new Uint8Array(0) // Dummy yang aman
-            };
-          } else if (validDecoderConfig) {
-            safeMeta.decoderConfig = validDecoderConfig;
-          }
-
-          try {
-            muxer.addVideoChunk(chunk, safeMeta);
-          } catch (err) {
-            console.error("Gagal menambahkan video chunk:", err);
-          }
-        },
+        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
         error: (e) => console.error("VideoEncoder error:", e),
       });
-
       videoEncoder.configure({
         codec: videoCodec,
         width,
         height,
         bitrate,
-        hardwareAcceleration: hwAccel || "prefer-hardware",
+        hardwareAcceleration: "prefer-hardware",
         bitrateMode: "variable",
       });
 
@@ -444,68 +402,54 @@ export default function Page() {
             currentFileBuffer = bufferToUse;
           } catch (e) {
             throw new Error(
-              "File videonya sudah tidak bisa diakses lagi. Silakan pilih ulang videonya lalu klik Proses tanpa berpindah aplikasi."
+              "File videonya sudah tidak bisa diakses lagi (izin dari sistem hilang, sering terjadi kalau file dipilih dari Galeri/Google Photos di Android). Silakan pilih ulang videonya lewat tombol upload, lalu langsung klik Proses tanpa berpindah aplikasi dulu."
             );
           }
         }
         const { mp4boxFile, videoTrack, audioTrack, videoSamples, audioSamples } =
           await demuxMp4(bufferToUse);
 
-        const rawSrcWidth = videoTrack.track_width || videoTrack.video?.width || currentMeta.width;
-        const rawSrcHeight = videoTrack.track_height || videoTrack.video?.height || currentMeta.height;
+        const srcWidth = videoTrack.track_width || videoTrack.video?.width || currentMeta.width;
+        const srcHeight = videoTrack.track_height || videoTrack.video?.height || currentMeta.height;
+        const targetHeight = srcHeight >= 1080 ? 1080 : srcHeight >= 720 ? srcHeight : 720;
+        let targetWidth = Math.round((srcWidth * targetHeight) / srcHeight);
+        if (targetWidth % 2 !== 0) targetWidth += 1;
+        const outHeight = targetHeight % 2 !== 0 ? targetHeight + 1 : targetHeight;
 
-        let rotation = 0;
-        if (videoTrack.matrix) {
-          const a = videoTrack.matrix[0];
-          const b = videoTrack.matrix[1];
-          if (a === 0 && b === 65536) rotation = 90;
-          else if (a === -65536) rotation = 180;
-          else if (a === 0 && b === -65536) rotation = 270;
-        }
-
-        if (rotation === 0) {
-           const metaPortrait = currentMeta.height > currentMeta.width;
-           const rawPortrait = rawSrcHeight > rawSrcWidth;
-           if (metaPortrait !== rawPortrait) {
-               rotation = 90; 
-           }
-        }
-
-        const isRotated = rotation === 90 || rotation === 270;
-        const displayWidth = isRotated ? rawSrcHeight : rawSrcWidth;
-        const displayHeight = isRotated ? rawSrcWidth : rawSrcHeight;
-
-        const targetDisplayHeight = displayHeight >= 1080 ? 1080 : displayHeight >= 720 ? displayHeight : 720;
-        let targetDisplayWidth = Math.round((displayWidth * targetDisplayHeight) / displayHeight);
-        
-        targetDisplayWidth = Math.ceil(targetDisplayWidth / 16) * 16;
-        const outHeight = Math.ceil(targetDisplayHeight / 16) * 16;
-
-        canvas.width = targetDisplayWidth;
+        canvas.width = targetWidth;
         canvas.height = outHeight;
         ctx = canvas.getContext("2d");
 
         const bitrate =
           outHeight >= 1080 ? 6_000_000 : outHeight >= 720 ? 4_000_000 : 2_500_000;
 
-        setProgress("Memilih encoder video (mencari kecocokan GPU/CPU)…");
-        const codecInfo = await pickVideoCodec(targetDisplayWidth, outHeight);
-        
-        if (!codecInfo) {
+        setProgress("Memilih encoder video (coba akses GPU)…");
+        const videoCodec = await pickVideoCodec(targetWidth, outHeight, "prefer-hardware");
+        if (!videoCodec) {
           throw new Error(
-            "Tidak ada encoder H.264 yang didukung browser ini (hardware maupun software). Pastikan perangkat/browser diupdate."
+            "Tidak ada encoder H.264 yang didukung browser ini (hardware maupun software)."
           );
         }
-        
-        const videoCodec = codecInfo.codec;
-        const hwAccel = codecInfo.hwAccel;
-        const usingHardware = hwAccel === "prefer-hardware";
+        // Cek apakah kandidat yang kepilih benar-benar jalan di GPU atau jatuh ke software,
+        // sekadar info di progress label — proses tetap lanjut walau fallback ke software.
+        let usingHardware = true;
+        try {
+          const support = await VideoEncoder.isConfigSupported({
+            codec: videoCodec,
+            width: targetWidth,
+            height: outHeight,
+            hardwareAcceleration: "prefer-hardware",
+          });
+          usingHardware = !!support.supported;
+        } catch (e) {
+          usingHardware = false;
+        }
 
         const videoDescription = getVideoDescription(mp4boxFile, videoTrack);
         const videoDecoderConfig = {
           codec: videoTrack.codec,
-          codedWidth: rawSrcWidth,
-          codedHeight: rawSrcHeight,
+          codedWidth: srcWidth,
+          codedHeight: srcHeight,
           description: videoDescription,
           hardwareAcceleration: "prefer-hardware",
         };
@@ -547,10 +491,9 @@ export default function Page() {
           currentPartStartUs = index * SPLIT_SECONDS * 1_000_000;
           currentPart = createPartWriter({
             Mp4Muxer,
-            width: targetDisplayWidth,
+            width: targetWidth,
             height: outHeight,
             videoCodec,
-            hwAccel, 
             bitrate,
             hasAudio,
             audioCodec: audioCodecStr,
@@ -572,52 +515,60 @@ export default function Page() {
           return Math.min(totalParts - 1, Math.max(0, idx));
         }
 
+        // Konstruksi VideoFrame langsung dari <canvas> punya bug di sebagian
+        // versi Chrome (terutama Android) yang bisa melempar
+        // "Cannot read properties of null (reading 'colorSpace')". Lewat
+        // ImageBitmap lebih stabil, jadi kita drawImage ke canvas lalu
+        // konversi ke ImageBitmap dulu sebelum bikin VideoFrame baru.
+        // Karena createImageBitmap async, frame diproses lewat antrean
+        // berurutan (frameChain) supaya tetap satu-per-satu sesuai urutan
+        // yang dikirim VideoDecoder.
+        let frameChain = Promise.resolve();
+
+        async function processVideoFrame(frame) {
+          try {
+            const tUs = frame.timestamp;
+            const idx = partIndexForUs(tUs);
+            if (idx !== currentPartIndex) {
+              finishCurrentPart();
+              startPart(idx);
+            }
+            const relativeUs = tUs - currentPartStartUs;
+
+            ctx.drawImage(frame, 0, 0, targetWidth, outHeight);
+            const bitmap = await createImageBitmap(canvas);
+            const scaled = new VideoFrame(bitmap, {
+              timestamp: Math.max(0, relativeUs),
+              duration: frame.duration || undefined,
+            });
+            currentPart.encodeVideoFrame(scaled, relativeUs === 0);
+            bitmap.close();
+
+            const overall =
+              (idx + Math.min(1, relativeUs / (SPLIT_SECONDS * 1_000_000))) / totalParts;
+            progressLabel.textContent =
+              totalParts > 1
+                ? `Memproses bagian ${idx + 1}/${totalParts} — ${Math.round(overall * 100)}% (GPU)`
+                : `Memproses video — ${Math.round((tUs / 1e6 / duration) * 100)}% (GPU)`;
+          } finally {
+            frame.close();
+          }
+        }
+
         function routeVideoFrame(frame) {
-          const tUs = frame.timestamp;
-          const idx = partIndexForUs(tUs);
-          if (idx !== currentPartIndex) {
-            finishCurrentPart();
-            startPart(idx);
-          }
-          const relativeUs = tUs - currentPartStartUs;
-
-          ctx.save();
-          if (rotation === 90) {
-            ctx.translate(canvas.width, 0);
-            ctx.rotate(Math.PI / 2);
-            ctx.drawImage(frame, 0, 0, canvas.height, canvas.width);
-          } else if (rotation === 180) {
-            ctx.translate(canvas.width, canvas.height);
-            ctx.rotate(Math.PI);
-            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-          } else if (rotation === 270) {
-            ctx.translate(0, canvas.height);
-            ctx.rotate(-Math.PI / 2);
-            ctx.drawImage(frame, 0, 0, canvas.height, canvas.width);
-          } else {
-            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-          }
-          ctx.restore();
-
-          const scaled = new VideoFrame(canvas, {
-            timestamp: Math.max(0, relativeUs),
-            duration: frame.duration || undefined,
-          });
-          currentPart.encodeVideoFrame(scaled, relativeUs === 0);
-          frame.close();
-
-          const overall = (idx + Math.min(1, relativeUs / (SPLIT_SECONDS * 1_000_000))) / totalParts;
-          const encMode = usingHardware ? "GPU" : "CPU";
-          progressLabel.textContent =
-            totalParts > 1
-              ? `Memproses bagian ${idx + 1}/${totalParts} — ${Math.round(overall * 100)}% (${encMode})`
-              : `Memproses video — ${Math.round((tUs / 1e6 / duration) * 100)}% (${encMode})`;
+          frameChain = frameChain
+            .then(() => processVideoFrame(frame))
+            .catch((e) => {
+              console.warn("Lewati 1 frame video bermasalah:", e);
+            });
         }
 
         function routeAudioData(data) {
           const tUs = data.timestamp;
           const idx = partIndexForUs(tUs);
           if (idx !== currentPartIndex) {
+            // audio nyampe setelah video pindah part: cukup buang sample ini,
+            // part berikutnya akan dibuka oleh video frame berikutnya.
             data.close();
             return;
           }
@@ -665,10 +616,11 @@ export default function Page() {
         }
         await videoDecoder.flush();
         safeCloseCodec(videoDecoder);
+        await frameChain; // pastikan semua frame video (async via ImageBitmap) sudah tuntas diproses
 
         if (hasAudio && audioDecoder) {
           for (const sample of audioSamples) {
-            if (audioDecoder.state === "closed") break; 
+            if (audioDecoder.state === "closed") break; // codec sudah menutup diri sendiri karena error
             const chunk = new EncodedAudioChunk({
               type: sample.is_sync ? "key" : "delta",
               timestamp: Math.round((sample.cts * 1_000_000) / sample.timescale),
@@ -694,8 +646,8 @@ export default function Page() {
         finishCurrentPart();
         setProgress(
           usingHardware
-            ? "Menyelesaikan file (Akselerasi GPU)…"
-            : "Menyelesaikan file (Mode CPU / Software)…"
+            ? "Menyelesaikan file (encoder GPU)…"
+            : "Menyelesaikan file (fallback software, GPU tidak tersedia di browser ini)…"
         );
 
         const outputs = await Promise.all(partPromises);
@@ -703,27 +655,20 @@ export default function Page() {
 
         progressRow.classList.add("hidden");
         resultPanel.classList.remove("hidden");
-        
         outputs.forEach(({ blob, index }) => {
           const url = URL.createObjectURL(blob);
           const partDur =
             index === totalParts - 1 ? duration - index * SPLIT_SECONDS : SPLIT_SECONDS;
-            
-          const resBitrate = ((blob.size * 8) / partDur / 1_000_000).toFixed(1);
-
           const card = document.createElement("div");
           card.className = "part";
           card.innerHTML = `
             <video src="${url}" controls></video>
             <div class="part-body">
-              <div class="part-title" style="margin-bottom: 4px;">
-                <span style="font-weight: 600;">${
+              <div class="part-title">
+                <span>${
                   totalParts > 1 ? `Bagian ${index + 1} dari ${totalParts}` : "Video jadi"
                 }</span>
-              </div>
-              <div style="font-size: 0.85em; color: #555; line-height: 1.4; margin-bottom: 12px;">
-                <div><b>Durasi:</b> ${fmtTime(partDur)} &nbsp;·&nbsp; <b>Ukuran:</b> ${fmtSize(blob.size)}</div>
-                <div><b>Resolusi:</b> ${canvas.width}×${canvas.height} &nbsp;·&nbsp; <b>Bitrate:</b> ${resBitrate} Mbps</div>
+                <span>${fmtTime(partDur)} · ${fmtSize(blob.size)}</span>
               </div>
               <a class="download" href="${url}" download="status-hd-${
             totalParts > 1 ? "part" + (index + 1) + "-" : ""
