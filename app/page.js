@@ -9,6 +9,8 @@ const MP4_MUXER_URL = "https://esm.run/mp4-muxer@5.2.2";
 export default function Page() {
   useEffect(() => {
     let currentFile = null;
+    let currentFileBuffer = null; // ArrayBuffer cache — dibaca sekali saat file dipilih
+    let currentFileReadError = null;
     let currentMeta = { duration: 0, width: 0, height: 0 };
 
     const dropzone = document.getElementById("dropzone");
@@ -52,10 +54,26 @@ export default function Page() {
       }
 
       currentFile = file;
+      currentFileBuffer = null;
+      currentFileReadError = null;
       errorBox.classList.add("hidden");
       resultPanel.classList.add("hidden");
       partsGrid.innerHTML = "";
       progressRow.classList.add("hidden");
+
+      // Baca isi file sekali sekarang dan simpan di memori. Di Android, File
+      // yang berasal dari Galeri/Google Photos kadang cuma bisa dibaca sekali;
+      // kalau kita nunggu sampai tombol "Proses" diklik (apalagi kalau user
+      // klik ulang setelah error), pembacaan kedua bisa ditolak sistem.
+      file
+        .arrayBuffer()
+        .then((buf) => {
+          currentFileBuffer = buf;
+        })
+        .catch((e) => {
+          console.warn("Gagal pre-baca file:", e);
+          currentFileReadError = e;
+        });
 
       const url = URL.createObjectURL(file);
       sourceVideo.src = url;
@@ -212,7 +230,7 @@ export default function Page() {
       return undefined;
     }
 
-    function demuxMp4(file) {
+    function demuxMp4(arrayBuffer) {
       return new Promise((resolve, reject) => {
         const mp4boxFile = window.MP4Box.createFile();
         const videoSamples = [];
@@ -241,17 +259,30 @@ export default function Page() {
           else if (ref === "audio") audioSamples.push(...samples);
         };
 
-        file
-          .arrayBuffer()
-          .then((buf) => {
-            buf.fileStart = 0;
-            mp4boxFile.appendBuffer(buf);
-            mp4boxFile.flush();
-            // onSamples dipanggil sinkron selama flush/appendBuffer di atas
-            resolve({ mp4boxFile, videoTrack, audioTrack, videoSamples, audioSamples });
-          })
-          .catch(reject);
+        try {
+          // Salin (slice) supaya buffer cache asli tidak ikut ter-detach/berubah
+          // dan bisa dipakai lagi kalau proses di-retry.
+          const buf = arrayBuffer.slice(0);
+          buf.fileStart = 0;
+          mp4boxFile.appendBuffer(buf);
+          mp4boxFile.flush();
+          // onSamples dipanggil sinkron selama flush/appendBuffer di atas
+          resolve({ mp4boxFile, videoTrack, audioTrack, videoSamples, audioSamples });
+        } catch (e) {
+          reject(e);
+        }
       });
+    }
+
+    // Sebuah codec (Video/AudioDecoder/Encoder) bisa menutup dirinya sendiri
+    // kalau terjadi error internal (state jadi "closed"). Memanggil .close()
+    // lagi setelah itu akan melempar exception, jadi selalu dicek dulu.
+    function safeCloseCodec(codec) {
+      try {
+        if (codec && codec.state !== "closed") codec.close();
+      } catch (e) {
+        console.warn("Gagal menutup codec (mungkin sudah closed):", e);
+      }
     }
 
     async function pickVideoCodec(width, height, hardwareAcceleration) {
@@ -328,7 +359,11 @@ export default function Page() {
         },
         async finish() {
           await videoEncoder.flush();
-          if (audioEncoder) await audioEncoder.flush();
+          safeCloseCodec(videoEncoder);
+          if (audioEncoder) {
+            await audioEncoder.flush();
+            safeCloseCodec(audioEncoder);
+          }
           muxer.finalize();
           return new Blob([target.buffer], { type: "video/mp4" });
         },
@@ -360,8 +395,19 @@ export default function Page() {
         const Mp4Muxer = await ensureMp4Muxer();
 
         setProgress("Membaca & membongkar MP4…");
+        let bufferToUse = currentFileBuffer;
+        if (!bufferToUse) {
+          try {
+            bufferToUse = await currentFile.arrayBuffer();
+            currentFileBuffer = bufferToUse;
+          } catch (e) {
+            throw new Error(
+              "File videonya sudah tidak bisa diakses lagi (izin dari sistem hilang, sering terjadi kalau file dipilih dari Galeri/Google Photos di Android). Silakan pilih ulang videonya lewat tombol upload, lalu langsung klik Proses tanpa berpindah aplikasi dulu."
+            );
+          }
+        }
         const { mp4boxFile, videoTrack, audioTrack, videoSamples, audioSamples } =
-          await demuxMp4(currentFile);
+          await demuxMp4(bufferToUse);
 
         const srcWidth = videoTrack.track_width || videoTrack.video?.width || currentMeta.width;
         const srcHeight = videoTrack.track_height || videoTrack.video?.height || currentMeta.height;
@@ -545,10 +591,11 @@ export default function Page() {
           videoDecoder.decode(chunk);
         }
         await videoDecoder.flush();
-        videoDecoder.close();
+        safeCloseCodec(videoDecoder);
 
         if (hasAudio && audioDecoder) {
           for (const sample of audioSamples) {
+            if (audioDecoder.state === "closed") break; // codec sudah menutup diri sendiri karena error
             const chunk = new EncodedAudioChunk({
               type: sample.is_sync ? "key" : "delta",
               timestamp: Math.round((sample.cts * 1_000_000) / sample.timescale),
@@ -561,12 +608,14 @@ export default function Page() {
               console.warn("Lewati sample audio bermasalah:", e);
             }
           }
-          try {
-            await audioDecoder.flush();
-          } catch (e) {
-            console.warn("Audio flush error:", e);
+          if (audioDecoder.state !== "closed") {
+            try {
+              await audioDecoder.flush();
+            } catch (e) {
+              console.warn("Audio flush error:", e);
+            }
           }
-          audioDecoder.close();
+          safeCloseCodec(audioDecoder);
         }
 
         finishCurrentPart();
